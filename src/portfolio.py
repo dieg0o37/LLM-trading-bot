@@ -137,13 +137,30 @@ def check_constraints(valuation: dict, cfg: Config) -> list[str]:
     return violations
 
 
-def apply_plan(state: dict, actions: list[dict], closes: dict[str, float]) -> tuple[dict, list[str]]:
-    """Simulate the model's plan against the local state.
+def apply_plan(state: dict, actions: list[dict], closes: dict[str, float],
+               max_position_pct: float | None = None
+               ) -> tuple[dict, list[str], list[dict]]:
+    """Convert target weights into whole-share trades and simulate them.
 
-    Used for two things: the `--apply` flag (persist the new portfolio) and,
-    always, to compute the POST-TRADE valuation that the constraint checker
-    runs on. Sells are executed before buys so proceeds are available to fund
-    purchases -- the same ordering a real rebalance would use.
+    The model supplies `target_weight_pct` only -- never a share count. Live
+    runs showed Claude Haiku 4.5's share arithmetic drifting badly (one run
+    asked for 63 AAPL shares while calling it a 6.2% position; it was 19.9%),
+    so the conversion happens here instead:
+
+        target_shares = floor(target_weight_pct / 100 * total_value / price)
+
+    `total_value` is taken from the PRE-trade portfolio and held fixed. That is
+    correct, not an approximation: buying converts cash into stock of equal
+    market value, so total value is invariant under trades at the same prices.
+
+    Flooring means a position always lands at or slightly BELOW its target, so
+    rounding can only free cash, never consume more than intended. A set of
+    weights that respects the cash floor therefore cannot breach it once
+    executed -- rounding error can no longer turn a compliant plan into a
+    violation.
+
+    Returns (new_state, log, sizing) where `sizing` records the derivation for
+    each action so the report can show what Python computed and why.
     """
     new_state = {
         "cash": float(state["cash"]),
@@ -153,31 +170,88 @@ def apply_plan(state: dict, actions: list[dict], closes: dict[str, float]) -> tu
         "history": list(state.get("history", [])),
     }
     log: list[str] = []
+    sizing: list[dict] = []
     today = date.today().isoformat()
     realised_this_run = 0.0
 
-    def sort_key(a):
-        return 0 if float(a.get("shares_delta", 0)) < 0 else 1
+    total_value = value_portfolio(state, closes)["total_value"]
 
-    for action in sorted(actions, key=sort_key):
+    # ---- 1. derive a share delta for every action ------------------------
+    planned: list[dict] = []
+    for action in actions:
         ticker = action.get("ticker")
-        delta = float(action.get("shares_delta", 0) or 0)
-        if not ticker or delta == 0:
+        if not ticker:
             continue
         price = closes.get(ticker)
-        if price is None:
+        if price is None or price <= 0:
             log.append(f"SKIP {ticker}: no price available")
             continue
 
+        held = float(new_state["positions"].get(ticker, {}).get("shares", 0.0))
+        verb = str(action.get("action", "")).upper()
+        # A full exit is an exit regardless of the weight the model wrote.
+        target_pct = 0.0 if verb == "SELL" else float(action.get("target_weight_pct", 0) or 0)
+        target_pct = max(0.0, target_pct)
+        # The 0-25 bound cannot live in the schema -- strict tool use rejects
+        # `minimum`/`maximum` on a number. Flag an over-cap request here, but do
+        # NOT clamp it: silently correcting the model would hide the error that
+        # check_constraints() exists to surface.
+        if max_position_pct is not None and target_pct > max_position_pct:
+            log.append(f"NOTE {ticker}: target {target_pct:.1f}% exceeds the "
+                       f"{max_position_pct:.0f}% cap — sized as asked so the "
+                       f"constraint check reports it")
+
+        target_shares = int(total_value * target_pct / 100.0 // price)
+        delta = target_shares - held
+
+        entry = {
+            "ticker": ticker,
+            "action": verb,
+            "target_weight_pct": round(target_pct, 2),
+            "price": round(price, 2),
+            "shares_before": held,
+            "target_shares": target_shares,
+            "shares_delta": delta,
+            "implied_value": round(target_shares * price, 2),
+            "implied_weight_pct": round(target_shares * price / total_value * 100, 2)
+            if total_value else 0.0,
+        }
+        sizing.append(entry)
+
+        # Flag a verb that contradicts its own arithmetic rather than silently
+        # obeying the number -- it usually means the model misread the position.
+        if verb in ("BUY", "ADD") and delta <= 0:
+            log.append(f"NOTE {ticker}: {verb} but target {target_pct:.1f}% is at or "
+                       f"below the {held:,.0f} shares already held — no trade")
+        elif verb == "TRIM" and delta >= 0:
+            log.append(f"NOTE {ticker}: TRIM but target {target_pct:.1f}% is at or "
+                       f"above the current holding — no trade")
+        if delta:
+            planned.append(entry)
+
+    # ---- 2. execute, sells first so proceeds fund the buys ---------------
+    for entry in sorted(planned, key=lambda e: 0 if e["shares_delta"] < 0 else 1):
+        ticker, delta, price = entry["ticker"], entry["shares_delta"], closes[entry["ticker"]]
         pos = new_state["positions"].get(ticker, {"shares": 0.0, "avg_cost": 0.0})
         shares, avg_cost = float(pos["shares"]), float(pos["avg_cost"])
 
         if delta > 0:
             cost = delta * price
             if cost > new_state["cash"] + 1e-6:
-                log.append(f"SKIP BUY {ticker}: needs ${cost:,.0f}, "
-                           f"only ${new_state['cash']:,.0f} cash")
-                continue
+                # Re-size to whatever cash actually remains rather than dropping
+                # the trade entirely.
+                affordable = int(new_state["cash"] // price)
+                if affordable <= 0:
+                    log.append(f"SKIP BUY {ticker}: needs ${cost:,.0f}, "
+                               f"only ${new_state['cash']:,.0f} cash")
+                    entry["shares_delta"] = 0
+                    continue
+                log.append(f"NOTE {ticker}: buy cut from {delta:,.0f} to "
+                           f"{affordable:,.0f} shares — insufficient cash")
+                delta = affordable
+                entry["shares_delta"] = delta
+                cost = delta * price
+
             new_avg = (shares * avg_cost + cost) / (shares + delta)
             new_state["cash"] -= cost
             new_state["positions"][ticker] = {"shares": shares + delta,
@@ -187,11 +261,13 @@ def apply_plan(state: dict, actions: list[dict], closes: dict[str, float]) -> tu
                 "shares": delta, "price": round(price, 4),
                 "value": round(cost, 2), "realised_pnl": 0.0,
             })
-            log.append(f"BUY  {ticker} {delta:+,.0f} @ ${price:,.2f} = ${cost:,.0f}")
+            log.append(f"BUY  {ticker} {delta:+,.0f} @ ${price:,.2f} = ${cost:,.0f} "
+                       f"-> {entry['implied_weight_pct']:.1f}%")
         else:
             sell = min(-delta, shares)
             if sell <= 0:
                 log.append(f"SKIP SELL {ticker}: no shares held")
+                entry["shares_delta"] = 0
                 continue
             proceeds = sell * price
             # Realised P&L on the shares actually sold, against average cost.
@@ -209,11 +285,11 @@ def apply_plan(state: dict, actions: list[dict], closes: dict[str, float]) -> tu
                 "value": round(proceeds, 2), "realised_pnl": round(realised, 2),
             })
             log.append(f"SELL {ticker} {-sell:+,.0f} @ ${price:,.2f} = ${proceeds:,.0f} "
-                       f"(realised {realised:+,.0f})")
+                       f"(realised {realised:+,.0f}) -> {entry['implied_weight_pct']:.1f}%")
 
     new_state["cash"] = round(new_state["cash"], 2)
     new_state["last_run_realised_pnl"] = round(realised_this_run, 2)
-    return new_state, log
+    return new_state, log, sizing
 
 
 def record_snapshot(state: dict, valuation: dict, note: str = "") -> dict:

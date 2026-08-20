@@ -26,18 +26,25 @@ provided to make decisions.
    - No single position may exceed 25% of post-trade total portfolio value.
    - Cash must be at least 10% of post-trade total portfolio value.
    A plan that violates either rule is rejected and reported as a failure.
-2. Trade in WHOLE SHARES only. `shares_delta` is an integer: positive to buy,
-   negative to sell, and it must be a share count, not a dollar amount.
+2. Size every action with `target_weight_pct` ONLY -- the position's intended
+   percent of total portfolio value AFTER the trade. Do NOT compute share
+   counts; the system converts weights to whole shares for you at the last
+   close. For a full exit (`SELL`), set `target_weight_pct` to 0.
 3. You may only trade tickers present in the watch list below. No other
    instruments, no shorting, no leverage, no options.
 4. Sells settle before buys, so proceeds from an exit are available to fund a
    purchase in the same plan.
-5. Doing nothing is a legitimate decision. If the data does not support a
+5. Your target weights must leave room for the cash floor. The sum of every
+   position's post-trade weight -- including positions you are NOT trading --
+   must not exceed 90% of total value. Check this sum before you answer;
+   share rounding can only free up cash, never consume more, so if your
+   weights are compliant the executed plan will be too.
+6. Doing nothing is a legitimate decision. If the data does not support a
    change, return an empty action list and say why.
-6. Every action needs a rationale that cites at least one specific metric
+7. Every action needs a rationale that cites at least one specific metric
    value from the data given to you. "Strong momentum" is not acceptable;
    "momentum_12_1_pct of 42.7 is the highest in the universe" is.
-7. Base every claim on the supplied numbers. You have no live market access
+8. Base every claim on the supplied numbers. You have no live market access
    and no knowledge of events after this data. Do not reference prices,
    earnings, or news that are not in this prompt.
 
@@ -115,14 +122,16 @@ PLAN_SCHEMA: dict = {
                         "description": "BUY opens a new position, ADD increases an "
                                        "existing one, TRIM reduces, SELL exits fully.",
                     },
-                    "shares_delta": {
-                        "type": "integer",
-                        "description": "Whole shares. Positive to buy, negative to sell.",
-                    },
                     "target_weight_pct": {
                         "type": "number",
-                        "description": "Intended post-trade weight as a percent of "
-                                       "total portfolio value. Must be <= 25.",
+                        "description": "The position's intended weight as a percent "
+                                       "of TOTAL portfolio value after this trade. "
+                                       "Must be a number between 0 and 25 "
+                                       "(the 25% cap is enforced after you "
+                                       "respond). Use 0 to exit "
+                                       "completely. This is the ONLY sizing input -- "
+                                       "share counts are computed from it, so do not "
+                                       "attempt the arithmetic yourself.",
                     },
                     "conviction": {"type": "string", "enum": ["low", "medium", "high"]},
                     "rationale": {
@@ -131,15 +140,15 @@ PLAN_SCHEMA: dict = {
                                        "from the supplied data.",
                     },
                 },
-                "required": ["ticker", "action", "shares_delta",
-                             "target_weight_pct", "conviction", "rationale"],
+                "required": ["ticker", "action", "target_weight_pct",
+                             "conviction", "rationale"],
                 "additionalProperties": False,
             },
         },
         "expected_cash_pct_after": {
             "type": "number",
-            "description": "Your own estimate of cash as a percent of total value "
-                           "after these trades. Must be >= 10.",
+            "description": "100 minus the sum of every post-trade position weight, "
+                           "including positions you are not trading. Must be >= 10.",
         },
         "risk_notes": {
             "type": "string",

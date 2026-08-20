@@ -133,7 +133,8 @@ def main() -> int:
     # ---- 6. simulate + VERIFY -------------------------------------------
     # The model asserts its plan is compliant. We do not take its word for it:
     # we apply the plan locally and re-derive the weights ourselves.
-    new_state, execution_log = apply_plan(state, plan.get("actions", []), closes)
+    new_state, execution_log, sizing = apply_plan(
+        state, plan.get("actions", []), closes, cfg.max_position_pct)
     valuation_after = value_portfolio(new_state, closes)
     violations = check_constraints(valuation_after, cfg)
     max_weight = max((h["weight_pct"] for h in valuation_after["holdings"]), default=0.0)
@@ -145,6 +146,9 @@ def main() -> int:
         "valuation_before": valuation_before,
         "valuation_after": valuation_after,
         "execution_log": execution_log,
+        # Python's weight -> share derivation, kept separate from the model's
+        # plan so the provenance of every share count stays unambiguous.
+        "sizing": sizing,
         "violations": violations,
         "max_weight_after": max_weight,
         "limits": {"max_position_pct": cfg.max_position_pct,

@@ -39,17 +39,23 @@ def print_report(result: dict) -> None:
 
     # --- actions -----------------------------------------------------------
     actions = plan.get("actions", [])
+    sizing = {s["ticker"]: s for s in result.get("sizing", [])}
     if actions:
-        t = Table(title="Proposed actions", box=box.SIMPLE_HEAVY, title_justify="left")
-        for col, just in [("Action", "left"), ("Ticker", "left"), ("Shares", "right"),
-                          ("Target wt", "right"), ("Conv.", "left"), ("Rationale", "left")]:
+        t = Table(title="Proposed actions  [dim](shares derived by Python from "
+                        "target weight)[/dim]",
+                  box=box.SIMPLE_HEAVY, title_justify="left")
+        for col, just in [("Action", "left"), ("Ticker", "left"),
+                          ("Target wt", "right"), ("Shares", "right"),
+                          ("Conv.", "left"), ("Rationale", "left")]:
             t.add_column(col, justify=just, overflow="fold")
         for a in actions:
+            z = sizing.get(a["ticker"], {})
+            delta = z.get("shares_delta", 0)
             t.add_row(
                 f"[{_ACTION_STYLE.get(a['action'], 'white')}]{a['action']}[/]",
                 a["ticker"],
-                f"{a['shares_delta']:+,d}",
                 f"{a['target_weight_pct']:.1f}%",
+                f"{delta:+,.0f}" if delta else "[dim]—[/dim]",
                 a["conviction"],
                 a["rationale"],
             )
@@ -141,12 +147,18 @@ def _render_markdown(result: dict) -> str:
     ]
 
     if plan.get("actions"):
-        L += ["| Action | Ticker | Shares | Target wt | Conviction | Rationale |",
+        sizing = {s["ticker"]: s for s in result.get("sizing", [])}
+        L += ["The model supplies `target_weight_pct`; share counts are derived in "
+              "Python at the last close.", "",
+              "| Action | Ticker | Target wt | Shares | Conviction | Rationale |",
               "|---|---|---:|---:|---|---|"]
         for a in plan["actions"]:
             rationale = a["rationale"].replace("|", "\\|")
-            L.append(f"| **{a['action']}** | {a['ticker']} | {a['shares_delta']:+,d} | "
-                     f"{a['target_weight_pct']:.1f}% | {a['conviction']} | {rationale} |")
+            delta = sizing.get(a["ticker"], {}).get("shares_delta", 0)
+            L.append(f"| **{a['action']}** | {a['ticker']} | "
+                     f"{a['target_weight_pct']:.1f}% | "
+                     f"{(f'{delta:+,.0f}' if delta else '—')} | "
+                     f"{a['conviction']} | {rationale} |")
     else:
         L.append("_No trades proposed — hold current positions._")
 
