@@ -16,7 +16,13 @@ from unittest import mock
 from src.config import load_config
 from src.data.prices import download_prices, latest_closes
 from src.features.technicals import compute_metrics, correlation_matrix
-from src.portfolio import apply_plan, check_constraints, value_portfolio
+from src.features.performance import (annual_returns, current_year_is_partial,
+                                      equal_weight_baseline,
+                                      per_ticker_consistency,
+                                      portfolio_annual_pnl,
+                                      summarise_stock_performance)
+from src.portfolio import (apply_plan, check_constraints, record_snapshot,
+                           value_portfolio)
 from src.agent.manager import _extract_plan, request_plan
 from src.agent.payload import build_payload, render_user_message
 from src.agent.prompts import PLAN_TOOL
@@ -72,9 +78,16 @@ def main() -> int:
     metrics = compute_metrics(prices, cfg.universe, cfg.benchmark)
     corr = correlation_matrix(prices, cfg.universe)
 
-    state = {"cash": 100000.0, "positions": {}}
+    annual = annual_returns(prices, cfg.universe)
+    bench_annual = annual_returns(prices, [cfg.benchmark])[cfg.benchmark]
+    consistency = per_ticker_consistency(annual)
+    stock_perf = summarise_stock_performance(annual, bench_annual)
+
+    state = {"cash": 100000.0, "positions": {}, "trades": [], "history": []}
     before = value_portfolio(state, closes)
-    payload = build_payload(before, metrics, corr, {}, cfg)
+    pnl_empty = portfolio_annual_pnl(state)
+    payload = build_payload(before, metrics, corr, {}, cfg, annual=annual,
+                            consistency=consistency, portfolio_pnl=pnl_empty)
     user_message = render_user_message(payload)
 
     checks: list[tuple[str, bool]] = []
@@ -85,6 +98,27 @@ def main() -> int:
     checks.append(("correlation matrix is 15x15",
                    len(payload["correlation_matrix_1y"]) == len(cfg.universe)))
     checks.append(("prompt is non-trivial", len(user_message) > 5000))
+
+    # --- calendar-year returns ------------------------------------------
+    checks.append(("10 calendar years of returns", len(annual) == 10))
+    checks.append(("annual returns cover the universe",
+                   set(annual.columns) == set(cfg.universe)))
+    checks.append(("equal-weight baseline is the cross-sectional mean",
+                   abs(equal_weight_baseline(annual).iloc[-1]
+                       - annual.iloc[-1].mean()) < 0.01))
+    checks.append(("benchmark has its own annual series", len(bench_annual) == 10))
+    checks.append(("per-year table carries best and worst",
+                   all("best" in r and "worst" in r for r in stock_perf["by_year"])))
+    checks.append(("consistency counts positive years",
+                   all(0 <= c["positive_years"] <= c["total_years"]
+                       for c in consistency.values())))
+    checks.append(("annual returns reach the prompt",
+                   "annual_returns_pct" in payload["watchlist_metrics"][0]))
+    checks.append(("current year flagged partial", current_year_is_partial(prices)))
+
+    # --- portfolio profit-per-year --------------------------------------
+    checks.append(("empty history reports unavailable, not zero",
+                   pnl_empty["available"] is False))
 
     # Both output modes must extract the identical plan.
     for mode in ("tool", "json_schema"):
@@ -134,12 +168,57 @@ def main() -> int:
         "limits": {"max_position_pct": cfg.max_position_pct,
                    "min_cash_pct": cfg.min_cash_pct},
     }
+    # Simulate three applied runs a year apart so profit-per-year has real
+    # history to fold. Values are hand-set; this tests the ACCOUNTING, not the
+    # market.
+    hist_state = {"cash": 100000.0, "positions": {}, "trades": [],
+                  "history": [
+                      {"date": "2024-01-05", "total_value": 100000.0, "cash": 100000.0,
+                       "positions_value": 0.0, "realised_pnl_in_run": 0.0},
+                      {"date": "2024-12-20", "total_value": 112000.0, "cash": 11000.0,
+                       "positions_value": 101000.0, "realised_pnl_in_run": 1500.0},
+                      {"date": "2025-12-19", "total_value": 105000.0, "cash": 12000.0,
+                       "positions_value": 93000.0, "realised_pnl_in_run": -800.0},
+                  ]}
+    hist_pnl = portfolio_annual_pnl(hist_state)
+    y2024 = next(r for r in hist_pnl["by_year"] if r["year"] == 2024)
+    y2025 = next(r for r in hist_pnl["by_year"] if r["year"] == 2025)
+    checks.append(("profit-per-year available with history", hist_pnl["available"]))
+    checks.append(("2024 profit = 12,000 (+12%)",
+                   y2024["profit_usd"] == 12000.0 and y2024["profit_pct"] == 12.0))
+    checks.append(("2025 loss carries from 2024 close, not inception",
+                   y2025["start_value"] == 112000.0 and y2025["profit_usd"] == -7000.0))
+    checks.append(("total profit is inception-to-date",
+                   hist_pnl["total_profit_usd"] == 5000.0))
+    checks.append(("realised P&L aggregates across years",
+                   hist_pnl["total_realised_pnl_usd"] == 700.0))
+
+    # A sell must book realised P&L against average cost.
+    seeded = {"cash": 0.0, "positions": {"AAPL": {"shares": 100, "avg_cost": 100.0}},
+              "trades": [], "history": []}
+    sold, _ = apply_plan(seeded, [{"ticker": "AAPL", "action": "SELL",
+                                   "shares_delta": -100}], {"AAPL": 150.0})
+    checks.append(("sell books realised P&L against avg cost",
+                   sold["last_run_realised_pnl"] == 5000.0))
+    checks.append(("trade ledger records the sell",
+                   len(sold["trades"]) == 1 and sold["trades"][0]["side"] == "SELL"))
+    record_snapshot(sold, value_portfolio(sold, {"AAPL": 150.0}), note="test")
+    checks.append(("snapshot captures realised P&L",
+                   sold["history"][-1]["realised_pnl_in_run"] == 5000.0))
+
+    result["portfolio_pnl"] = hist_pnl
+    result["stock_performance"] = stock_perf
+    result["current_year_partial"] = current_year_is_partial(prices)
     print_report(result)
     json_path, md_path = write_reports(result)
     md = md_path.read_text()
     checks.append(("markdown report renders the action table", "| **BUY** | CAT |" in md))
     checks.append(("markdown report records the constraint verdict", "**PASSED**" in md))
     checks.append(("json report round-trips", json.loads(json_path.read_text())["plan"] == plan))
+    checks.append(("markdown reports profit per year", "## Profit per year" in md))
+    checks.append(("markdown reports calendar-year returns",
+                   "## Watch-list returns by calendar year" in md))
+    checks.append(("markdown disclaims the backtest gap", "not a backtest" in md))
 
     print("\n--- assertions ---")
     failed = 0

@@ -65,6 +65,18 @@ All `*_pct` fields are already percentages (12.5 means 12.5%, not 1250%).
 - `pct_below_52w_high`: distance from the 52-week high (negative or zero).
 - `volume_20d_vs_90d`: recent volume relative to its 90-day average; above 1.0
   means unusual participation.
+- `annual_returns_pct`: total return for each calendar year, keyed by year. The
+  most recent year is PARTIAL (year-to-date), so do not compare it directly
+  against completed years.
+- `annual_consistency`: `positive_years` out of `total_years`, plus the best,
+  worst, and median calendar year. Use it to separate a steady compounder from
+  a stock whose long-run average was produced by one explosive year. A high
+  `ret_10y_ann_pct` with a low `positive_years` count is a warning, not a
+  recommendation.
+- `portfolio_performance`: this portfolio's own realised profit history, when
+  enough runs have been recorded. It is a record of outcomes, NOT evidence
+  that previous decisions were skillful -- do not treat a good past year as
+  confirmation that the current strategy is right.
 - `correlation_matrix`: pairwise 1-year return correlations across the watch
   list. Use it so diversification is data-driven -- two names correlated at
   0.85 do not diversify each other.

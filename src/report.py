@@ -100,6 +100,9 @@ def print_report(result: dict) -> None:
     console.print(Panel(plan["risk_notes"], title="Risk notes",
                         border_style="dim", box=box.ROUNDED))
 
+    _print_portfolio_pnl(result)
+    _print_stock_years(result)
+
     # --- API telemetry -----------------------------------------------------
     u = meta["usage"]
     console.print(
@@ -168,6 +171,8 @@ def _render_markdown(result: dict) -> str:
     L += ["", "### Model's own self-check", "", f"> {plan['constraint_self_check']}",
           "", "## Risk notes", "", plan["risk_notes"], ""]
 
+    L += _markdown_performance(result)
+
     if result["execution_log"]:
         L += ["## Simulated fills", "", "```"] + result["execution_log"] + ["```", ""]
 
@@ -185,3 +190,114 @@ def _render_markdown(result: dict) -> str:
               "```", meta["thinking"], "```", "", "</details>", ""]
 
     return "\n".join(L)
+
+
+def _print_portfolio_pnl(result: dict) -> None:
+    """This portfolio's own realised profit per calendar year."""
+    pnl = result.get("portfolio_pnl") or {}
+    if not pnl.get("available"):
+        console.print(f"[dim]Profit per year: not available yet — "
+                      f"{pnl.get('reason', 'no history recorded')}[/dim]")
+        return
+
+    t = Table(title=f"Portfolio profit per year (since {pnl['inception_date']})",
+              box=box.SIMPLE_HEAVY, title_justify="left")
+    for col in ["Year", "Start", "End", "Profit $", "Profit %", "Realised $"]:
+        t.add_column(col, justify="right" if col != "Year" else "left")
+    for row in pnl["by_year"]:
+        colour = "green" if row["profit_usd"] >= 0 else "red"
+        t.add_row(str(row["year"]),
+                  f"${row['start_value']:,.0f}",
+                  f"${row['end_value']:,.0f}",
+                  f"[{colour}]{row['profit_usd']:+,.0f}[/{colour}]",
+                  f"[{colour}]{row['profit_pct']:+.2f}%[/{colour}]",
+                  f"{row['realised_pnl_usd']:+,.0f}")
+    total_colour = "green" if pnl["total_profit_usd"] >= 0 else "red"
+    t.add_row("[bold]TOTAL[/bold]",
+              f"${pnl['inception_value']:,.0f}",
+              f"${pnl['current_value']:,.0f}",
+              f"[bold {total_colour}]{pnl['total_profit_usd']:+,.0f}[/bold {total_colour}]",
+              f"[bold {total_colour}]{pnl['total_profit_pct']:+.2f}%[/bold {total_colour}]",
+              f"{pnl['total_realised_pnl_usd']:+,.0f}")
+    console.print(t)
+
+
+def _print_stock_years(result: dict) -> None:
+    """Calendar-year returns of the universe vs an equal-weight basket."""
+    perf = result.get("stock_performance") or {}
+    rows = perf.get("by_year", [])
+    if not rows:
+        return
+
+    t = Table(title="Watch-list returns by calendar year", box=box.SIMPLE_HEAVY,
+              title_justify="left")
+    t.add_column("Year"); t.add_column("Equal-wt universe", justify="right")
+    t.add_column("SPY", justify="right"); t.add_column("Best", justify="right")
+    t.add_column("Worst", justify="right")
+    for row in rows:
+        ew, bm = row.get("equal_weight_universe_pct"), row.get("benchmark_pct")
+        label = f"{row['year']}"
+        if result.get("current_year_partial") and row["year"] == rows[-1]["year"]:
+            label += " *"
+        t.add_row(label,
+                  _signed(ew), _signed(bm),
+                  f"[green]{row['best']}[/green]",
+                  f"[red]{row['worst']}[/red]")
+    console.print(t)
+    if result.get("current_year_partial"):
+        console.print("[dim]  * current year is partial (year-to-date)[/dim]")
+
+
+def _signed(x) -> str:
+    if x is None:
+        return "—"
+    colour = "green" if x >= 0 else "red"
+    return f"[{colour}]{x:+.1f}%[/{colour}]"
+
+
+def _markdown_performance(result: dict) -> list[str]:
+    """Profit-per-year sections for the Markdown report."""
+    L: list[str] = ["## Profit per year", ""]
+
+    pnl = result.get("portfolio_pnl") or {}
+    if pnl.get("available"):
+        L += [f"Tracked since **{pnl['inception_date']}** across "
+              f"{pnl['snapshots']} recorded runs.", "",
+              "| Year | Start | End | Profit $ | Profit % | Realised $ |",
+              "|---|---:|---:|---:|---:|---:|"]
+        for row in pnl["by_year"]:
+            L.append(f"| {row['year']} | ${row['start_value']:,.0f} | "
+                     f"${row['end_value']:,.0f} | {row['profit_usd']:+,.0f} | "
+                     f"{row['profit_pct']:+.2f}% | {row['realised_pnl_usd']:+,.0f} |")
+        L.append(f"| **TOTAL** | ${pnl['inception_value']:,.0f} | "
+                 f"${pnl['current_value']:,.0f} | "
+                 f"**{pnl['total_profit_usd']:+,.0f}** | "
+                 f"**{pnl['total_profit_pct']:+.2f}%** | "
+                 f"{pnl['total_realised_pnl_usd']:+,.0f} |")
+    else:
+        L.append(f"_Not available yet — {pnl.get('reason', 'no history recorded')}_")
+
+    L += ["", "> This is a record of outcomes, not a backtest. It does not show "
+          "whether the agent's decisions beat holding the universe — see the "
+          "README section *Profit per year is not a backtest*.", ""]
+
+    perf = result.get("stock_performance") or {}
+    rows = perf.get("by_year", [])
+    if rows:
+        L += ["## Watch-list returns by calendar year", "",
+              "| Year | Equal-weight universe | SPY | Best | Worst |",
+              "|---|---:|---:|---:|---:|"]
+        for row in rows:
+            label = str(row["year"])
+            if result.get("current_year_partial") and row["year"] == rows[-1]["year"]:
+                label += " *"
+            ew = row.get("equal_weight_universe_pct")
+            bm = row.get("benchmark_pct")
+            L.append(f"| {label} | {ew:+.1f}% | "
+                     f"{(f'{bm:+.1f}%' if bm is not None else '—')} | "
+                     f"{row['best']} | {row['worst']} |")
+        if result.get("current_year_partial"):
+            L += ["", "_* current year is partial (year-to-date)._"]
+        L.append("")
+
+    return L

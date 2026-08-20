@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, asdict
+from datetime import date
 from pathlib import Path
 
 from .config import PORTFOLIO_PATH, Config
@@ -33,8 +34,26 @@ class Holding:
 
 
 def seed_portfolio(cfg: Config, path: Path = PORTFOLIO_PATH) -> dict:
-    """Create an all-cash starting portfolio if none exists."""
-    state = {"cash": float(cfg.portfolio["starting_cash"]), "positions": {}}
+    """Create an all-cash starting portfolio if none exists.
+
+    The inception snapshot is written immediately so that profit-per-year has a
+    baseline to measure the first real run against.
+    """
+    cash = float(cfg.portfolio["starting_cash"])
+    state = {
+        "cash": cash,
+        "positions": {},
+        "inception_date": date.today().isoformat(),
+        "trades": [],
+        "history": [{
+            "date": date.today().isoformat(),
+            "total_value": cash,
+            "cash": cash,
+            "positions_value": 0.0,
+            "realised_pnl_in_run": 0.0,
+            "note": "inception",
+        }],
+    }
     path.write_text(json.dumps(state, indent=2))
     print(f"[portfolio] seeded new all-cash portfolio "
           f"(${state['cash']:,.0f}) -> {path.name}")
@@ -47,6 +66,9 @@ def load_portfolio(cfg: Config, path: Path = PORTFOLIO_PATH) -> dict:
     state = json.loads(path.read_text())
     state.setdefault("cash", 0.0)
     state.setdefault("positions", {})
+    state.setdefault("trades", [])
+    state.setdefault("history", [])
+    state.setdefault("last_run_realised_pnl", 0.0)
     return state
 
 
@@ -123,9 +145,16 @@ def apply_plan(state: dict, actions: list[dict], closes: dict[str, float]) -> tu
     runs on. Sells are executed before buys so proceeds are available to fund
     purchases -- the same ordering a real rebalance would use.
     """
-    new_state = {"cash": float(state["cash"]),
-                 "positions": {k: dict(v) for k, v in state["positions"].items()}}
+    new_state = {
+        "cash": float(state["cash"]),
+        "positions": {k: dict(v) for k, v in state["positions"].items()},
+        "inception_date": state.get("inception_date"),
+        "trades": list(state.get("trades", [])),
+        "history": list(state.get("history", [])),
+    }
     log: list[str] = []
+    today = date.today().isoformat()
+    realised_this_run = 0.0
 
     def sort_key(a):
         return 0 if float(a.get("shares_delta", 0)) < 0 else 1
@@ -153,19 +182,53 @@ def apply_plan(state: dict, actions: list[dict], closes: dict[str, float]) -> tu
             new_state["cash"] -= cost
             new_state["positions"][ticker] = {"shares": shares + delta,
                                               "avg_cost": round(new_avg, 4)}
+            new_state["trades"].append({
+                "date": today, "ticker": ticker, "side": "BUY",
+                "shares": delta, "price": round(price, 4),
+                "value": round(cost, 2), "realised_pnl": 0.0,
+            })
             log.append(f"BUY  {ticker} {delta:+,.0f} @ ${price:,.2f} = ${cost:,.0f}")
         else:
             sell = min(-delta, shares)
             if sell <= 0:
                 log.append(f"SKIP SELL {ticker}: no shares held")
                 continue
-            new_state["cash"] += sell * price
+            proceeds = sell * price
+            # Realised P&L on the shares actually sold, against average cost.
+            realised = sell * (price - avg_cost)
+            realised_this_run += realised
+            new_state["cash"] += proceeds
             remaining = shares - sell
             if remaining <= 1e-9:
                 new_state["positions"].pop(ticker, None)
             else:
                 new_state["positions"][ticker] = {"shares": remaining, "avg_cost": avg_cost}
-            log.append(f"SELL {ticker} {-sell:+,.0f} @ ${price:,.2f} = ${sell * price:,.0f}")
+            new_state["trades"].append({
+                "date": today, "ticker": ticker, "side": "SELL",
+                "shares": -sell, "price": round(price, 4),
+                "value": round(proceeds, 2), "realised_pnl": round(realised, 2),
+            })
+            log.append(f"SELL {ticker} {-sell:+,.0f} @ ${price:,.2f} = ${proceeds:,.0f} "
+                       f"(realised {realised:+,.0f})")
 
     new_state["cash"] = round(new_state["cash"], 2)
+    new_state["last_run_realised_pnl"] = round(realised_this_run, 2)
     return new_state, log
+
+
+def record_snapshot(state: dict, valuation: dict, note: str = "") -> dict:
+    """Append a valuation snapshot -- the raw material for profit-per-year.
+
+    Called only on `--apply`, because a notification-only run must not mutate
+    the tracked history. One snapshot per applied run; `portfolio_annual_pnl()`
+    takes the last snapshot of each calendar year as that year's close.
+    """
+    state.setdefault("history", []).append({
+        "date": date.today().isoformat(),
+        "total_value": valuation["total_value"],
+        "cash": valuation["cash"],
+        "positions_value": valuation["positions_value"],
+        "realised_pnl_in_run": state.get("last_run_realised_pnl", 0.0),
+        "note": note,
+    })
+    return state

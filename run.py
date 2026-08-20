@@ -16,8 +16,13 @@ from src.config import PORTFOLIO_PATH, REPORT_DIR, load_config
 from src.data.news import download_news
 from src.data.prices import download_prices, latest_closes
 from src.features.technicals import compute_metrics, correlation_matrix
+from src.features.performance import (annual_returns, current_year_is_partial,
+                                      per_ticker_consistency,
+                                      portfolio_annual_pnl,
+                                      summarise_stock_performance)
 from src.portfolio import (apply_plan, check_constraints, load_portfolio,
-                           save_portfolio, seed_portfolio, value_portfolio)
+                           record_snapshot, save_portfolio, seed_portfolio,
+                           value_portfolio)
 from src.report import console, print_report, write_reports
 from src.agent.manager import ManagerError, request_plan
 from src.agent.payload import build_payload, render_user_message
@@ -72,8 +77,27 @@ def main() -> int:
     corr = correlation_matrix(prices, cfg.universe)
     print(f"[technicals] {metrics.shape[0]} tickers x {metrics.shape[1] - 1} metrics computed")
 
+    # Calendar-year returns: per-stock history (always available) and the
+    # equal-weight / benchmark comparison rows.
+    annual = annual_returns(prices, cfg.universe)
+    bench_annual = annual_returns(prices, [cfg.benchmark])[cfg.benchmark]
+    consistency = per_ticker_consistency(annual)
+    stock_performance = summarise_stock_performance(annual, bench_annual)
+    partial_year = current_year_is_partial(prices)
+    print(f"[performance] {len(annual)} calendar years of returns computed "
+          f"({'current year partial' if partial_year else 'all years complete'})")
+
     # ---- 3. current portfolio -------------------------------------------
     state = load_portfolio(cfg)
+    # Profit-per-year of THIS portfolio, from snapshots recorded on --apply runs.
+    portfolio_pnl = portfolio_annual_pnl(state)
+    if portfolio_pnl["available"]:
+        print(f"[performance] portfolio tracked since "
+              f"{portfolio_pnl['inception_date']}: "
+              f"{portfolio_pnl['total_profit_pct']:+.2f}% total")
+    else:
+        print(f"[performance] portfolio profit-per-year unavailable "
+              f"({portfolio_pnl['snapshots']} snapshot(s) recorded)")
     valuation_before = value_portfolio(state, closes)
     pre_violations = check_constraints(valuation_before, cfg)
     if pre_violations:
@@ -83,7 +107,9 @@ def main() -> int:
             console.print(f"  [yellow]• {v}[/yellow]")
 
     # ---- 4. prompt -------------------------------------------------------
-    payload = build_payload(valuation_before, metrics, corr, news, cfg)
+    payload = build_payload(valuation_before, metrics, corr, news, cfg,
+                            annual=annual, consistency=consistency,
+                            portfolio_pnl=portfolio_pnl)
     user_message = render_user_message(payload)
 
     if args.dry_run:
@@ -125,6 +151,9 @@ def main() -> int:
                    "min_cash_pct": cfg.min_cash_pct},
         "news_used": sorted(news.keys()),
         "universe": cfg.universe,
+        "portfolio_pnl": portfolio_pnl,
+        "stock_performance": stock_performance,
+        "current_year_partial": partial_year,
     }
 
     # ---- 7. notify -------------------------------------------------------
@@ -136,9 +165,15 @@ def main() -> int:
             console.print("[red]--apply refused: the plan violates hard constraints. "
                           "portfolio.json is unchanged.[/red]")
         else:
+            # Record the post-trade valuation so profit-per-year has a data
+            # point for this run. Only applied runs are recorded -- a
+            # notification-only run must not mutate the tracked history.
+            record_snapshot(new_state, valuation_after,
+                            note=f"{len(plan.get('actions', []))} action(s)")
             save_portfolio(new_state)
             console.print(f"[green]--apply: portfolio.json updated "
-                          f"({PORTFOLIO_PATH.name}).[/green]")
+                          f"({PORTFOLIO_PATH.name}), snapshot recorded "
+                          f"({len(new_state['history'])} total).[/green]")
 
     return 2 if violations else 0
 
