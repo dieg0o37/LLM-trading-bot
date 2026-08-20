@@ -16,8 +16,6 @@ files a rebalancing plan.
 
 - **No broker is connected.** No order is ever placed anywhere. The only
   outputs are a console printout and files in `data/reports/`.
-- **No backtest.** The agent is asked one question about one day. There is no
-  walk-forward evaluation, so there is no evidence the decisions are any good.
 - **No live data during reasoning.** The model sees exactly the JSON payload
   we hand it and is instructed to use nothing else.
 
@@ -65,6 +63,9 @@ python3 -m tests.test_offline
                  ┌────────▼─────────┐
                  │  src/features/   │  ~30 scalar metrics per ticker
                  │  technicals.py   │  + 15×15 correlation matrix
+                 ├──────────────────┤
+                 │  src/features/   │  calendar-year returns per stock,
+                 │  performance.py  │  + this portfolio's profit per year
                  └────────┬─────────┘
                           │
   Alpha Vantage  ┌────────▼─────────┐
@@ -79,8 +80,9 @@ python3 -m tests.test_offline
                  └────────┬─────────┘
                           │  validated plan JSON
                  ┌────────▼─────────┐
-                 │  src/portfolio.py│  simulate fills, re-derive weights,
-                 │                  │  VERIFY constraints in Python
+                 │  src/portfolio.py│  simulate fills, book realised P&L,
+                 │                  │  re-derive weights, VERIFY constraints,
+                 │                  │  record a valuation snapshot
                  └────────┬─────────┘
                           │
                  ┌────────▼─────────┐
@@ -99,12 +101,13 @@ python3 -m tests.test_offline
 | `src/data/prices.py` | yfinance download, MultiIndex flattening, parquet cache |
 | `src/data/news.py` | Alpha Vantage NEWS_SENTIMENT client, cache, graceful degradation |
 | `src/features/technicals.py` | All pandas indicator maths |
+| `src/features/performance.py` | Calendar-year returns, equal-weight baseline, portfolio profit-per-year |
 | `src/agent/prompts.py` | The system prompt and the JSON schema for the plan |
 | `src/agent/payload.py` | Builds and renders the user message |
 | `src/agent/manager.py` | The Anthropic API call, both output modes, error handling |
-| `src/portfolio.py` | State, mark-to-market, trade simulation, **constraint verifier** |
+| `src/portfolio.py` | State, mark-to-market, trade simulation, realised-P&L ledger, snapshots, **constraint verifier** |
 | `src/report.py` | Console, JSON, and Markdown output |
-| `tests/test_offline.py` | 19-assertion end-to-end test with a mocked API |
+| `tests/test_offline.py` | 39-assertion end-to-end test with a mocked API |
 
 ---
 
@@ -246,6 +249,106 @@ A **15×15 one-year correlation matrix** is included so "diversify" is a
 data-backed instruction rather than a vibe — the model can see that MSFT and
 NVDA move together while XOM does not, instead of guessing from sector labels.
 
+### Calendar-year returns
+| Metric | Definition |
+|---|---|
+| `annual_returns_pct` | Total return for each of the last 10 calendar years, keyed by year. The current year is partial (YTD) and flagged as such |
+| `annual_consistency` | `positive_years` out of `total_years`, plus best, worst, and median year |
+
+`annual_consistency` exists to separate a steady compounder from a stock whose
+ten-year average was manufactured by a single explosive year. A high
+`ret_10y_ann_pct` next to a low `positive_years` count is a warning, and the
+system prompt says so explicitly.
+
+---
+
+## Profit per year
+
+Two different profit figures are computed, and keeping them apart matters.
+
+### 1. Watch-list returns by calendar year
+
+Straight from the price history, so it is available on the very first run and
+needs no portfolio at all. For each of the last 10 calendar years the report
+shows the **equal-weight universe return**, the **SPY return**, and the best
+and worst performer.
+
+```
+  Year     Equal-wt universe      SPY           Best         Worst
+  2022                 -11.2%    -18.2%     XOM +87.4%   META -64.2%
+  2023                 +49.5%    +26.2%   NVDA +239.0%     JNJ -8.6%
+  2026 *               +13.8%    +12.6%     XOM +41.6%   META -18.0%
+  * current year is partial (year-to-date)
+```
+
+The equal-weight column is the cross-sectional mean of the per-stock annual
+returns, which is exactly the return of a basket rebalanced to equal weights
+each year end. That is the honest **"no skill" baseline** — what you would have
+earned by buying the entire watch list and thinking about nothing. Any future
+claim that the agent adds value has to beat that column, not merely be
+positive.
+
+### 2. This portfolio's profit per year
+
+Derived from valuation snapshots written on each `--apply` run:
+
+```
+  Year       Start        End   Profit $   Profit %   Realised $
+  2024    $100,000   $112,000    +12,000    +12.00%       +1,500
+  2025    $112,000   $105,000     -7,000     -6.25%         -800
+  TOTAL   $100,000   $105,000     +5,000     +5.00%         +700
+```
+
+- Each year opens at the **previous year's close**, not at inception, so the
+  yearly figures are independent rather than cumulative.
+- **Realised $** is separated from total profit. `apply_plan()` books realised
+  P&L on every sell against the position's average cost and writes it to a
+  trade ledger in `portfolio.json`; the rest of the profit is unrealised
+  mark-to-market.
+- There are no deposits or withdrawals in this simulation, so profit for a year
+  is simply end value minus start value. If external cash flows were ever
+  added, this arithmetic would need time-weighted returns instead.
+- With fewer than two snapshots the report prints **"not available yet"** and
+  the reason. It never prints a fabricated zero.
+
+Snapshots are only recorded on `--apply`. A notification-only run must not
+mutate the tracked history, or the record would fill with hypothetical
+portfolios that were never held.
+
+### Profit per year is not a backtest
+
+Worth being blunt, because the two are easy to conflate.
+
+Profit per year answers **"what happened to the money?"** A backtest answers
+**"were the agent's decisions better than the alternative?"** The second does
+not follow from the first. In a year when the whole universe rises 30%, an
+agent that returns 20% shows a healthy-looking profit while having actively
+destroyed value versus doing nothing.
+
+That is exactly why the report prints the **equal-weight universe** and **SPY**
+columns next to the portfolio's own numbers — so the comparison is at least
+visible, even though it is not yet a controlled one.
+
+A real backtest would require:
+
+1. **Point-in-time metric computation** — recomputing every technical as of
+   each historical rebalance date, using only bars available then. The current
+   `compute_metrics()` deliberately computes as of the *last* bar.
+2. **Replaying the LLM** at each rebalance date, with a prompt containing no
+   post-dated information. Roughly 40 API calls for a decade of quarterly
+   rebalances, per configuration tested.
+3. **Point-in-time news**, which Alpha Vantage's free tier cannot supply deep
+   enough history for.
+4. **A survivorship-free universe** — today's 15 mega-caps were selected with
+   hindsight, so replaying them over 15 years is biased upward no matter how
+   careful the rest of the harness is.
+5. **Multiple runs per date**, since the model is stochastic; a single path
+   tells you almost nothing.
+
+Points 4 and 5 are the ones that make a quick version misleading rather than
+merely incomplete. None of this is implemented, and the reported profit
+figures should not be read as if it were.
+
 ---
 
 ## Data sources
@@ -347,11 +450,21 @@ python3 run.py [options]
 
 ### Portfolio state
 
-`portfolio.json` is seeded as $100,000 all cash on first run. By default a run
-**reads** it and never writes — the agent is notification-only, so it reports
-what it would do without silently mutating state. `--apply` opts into
-persistence, which is what you want if you're running it repeatedly and want
-the model to see real evolving positions.
+`portfolio.json` is seeded as $100,000 all cash on first run, with an
+inception snapshot so profit-per-year has a baseline immediately. It holds:
+
+| Key | Contents |
+|---|---|
+| `cash`, `positions` | Current state; each position carries `shares` and `avg_cost` |
+| `inception_date` | When tracking began |
+| `trades` | Ledger: every simulated fill with date, side, shares, price, and realised P&L |
+| `history` | Valuation snapshots — the raw material for profit-per-year |
+
+By default a run **reads** it and never writes — the agent is notification-only,
+so it reports what it would do without silently mutating state. `--apply` opts
+into persistence and records a snapshot, which is what you want if you're
+running it repeatedly and want both the model and the P&L table to see a real
+evolving portfolio.
 
 ---
 
@@ -387,11 +500,13 @@ Three artefacts per run:
 
 1. **Console** — a `rich` printout: market assessment, colour-coded action
    table, simulated fills, before/after weights, a green or red constraint
-   verdict, risk notes, and API telemetry.
+   verdict, risk notes, **profit per year**, **watch-list returns by calendar
+   year**, and API telemetry.
 2. **`data/reports/<timestamp>.json`** — the complete run: plan, both
    valuations, execution log, violations, and full call metadata.
 3. **`data/reports/<timestamp>.md`** — a human-readable report, including the
-   model's self-check next to the Python verdict, and extended thinking in a
+   model's self-check next to the Python verdict, both profit-per-year tables
+   (carrying the not-a-backtest caveat inline), and extended thinking in a
    collapsible block when enabled.
 
 Timestamped, so history accumulates as an audit trail.
@@ -404,7 +519,7 @@ Timestamped, so history accumulates as an audit trail.
 python3 -m tests.test_offline
 ```
 
-19 assertions covering everything except the network call itself, which is
+39 assertions covering everything except the network call itself, which is
 mocked with a canned `tool_use` response. It verifies:
 
 - the payload carries all 15 tickers, each with ≥10 years of history, plus a
@@ -416,7 +531,15 @@ mocked with a canned `tool_use` response. It verifies:
 - a compliant plan passes the constraint checker — **and a non-compliant one
   fails it**, catching both the position cap and the cash floor. (A checker
   that only ever passes is worthless, so the negative case is tested too.)
-- the JSON report round-trips and the Markdown renders.
+- 10 calendar years of returns are produced for the whole universe, the
+  equal-weight baseline really is the cross-sectional mean, and the annual
+  figures reach the prompt;
+- profit-per-year accounting is correct on hand-set history: each year opens at
+  the **prior year's close** rather than at inception, realised P&L aggregates
+  across years, and an empty history reports *unavailable* rather than zero;
+- a sell books realised P&L against average cost and lands in the trade ledger;
+- the JSON report round-trips and the Markdown renders, including both
+  profit-per-year tables and the not-a-backtest caveat.
 
 ---
 
@@ -455,14 +578,29 @@ comparison is real rather than aspirational.
 Anthropic key and nothing else, so every news failure path degrades to
 price-only with a printed reason.
 
+**Profit per year ships with its own baseline.** A bare profit number invites
+the reader to mistake a rising market for a working agent, so the equal-weight
+universe and SPY columns are printed alongside it and the not-a-backtest caveat
+is embedded in the Markdown report itself, not just this README.
+
+**Missing history reports "unavailable", never zero.** A fabricated $0 profit
+row is indistinguishable from a real flat year. The report states how many
+snapshots exist and what is needed instead.
+
+**Snapshots only on `--apply`.** Recording every notification-only run would
+fill the track record with portfolios that were never held.
+
 ---
 
 ## Limitations
 
 Worth being explicit, since the failure modes are not all obvious:
-
-- **No backtest, so no evidence of skill.** One question, one day. Nothing here
-  says the model's decisions beat holding SPY.
+- **Profit per year needs history to mean anything.** It is derived from
+  `--apply` snapshots, so a fresh portfolio reports *unavailable*, and a
+  portfolio with two snapshots a week apart produces a "yearly" figure covering
+  one week. Treat short histories as noise.
+- **No time-weighted returns.** Yearly profit is end value minus start value,
+  which is correct only because this simulation has no deposits or withdrawals.
 - **Fills are simulated at the last daily close.** No slippage, no spread, no
   commission, no market impact, no intraday movement.
 - **Whole shares only**, so target weights are approximate — the schema asks
@@ -472,7 +610,8 @@ Worth being explicit, since the failure modes are not all obvious:
   *today*. Their 15-year histories look excellent partly because of how they
   were selected.
 - **Point-in-time metrics only.** The model sees today's values, not how they
-  evolved, so it cannot see a metric deteriorating.
+  evolved, so it cannot see a metric deteriorating. Calendar-year returns are
+  the one partial exception — they do show a multi-year trajectory.
 - **News sentiment is a vendor black box.** Alpha Vantage's scoring method is
   undisclosed; the prompt tells the model to treat it as weak evidence.
 - **`avg_cost` is not tax-aware** and there is no realised-P&L ledger.
