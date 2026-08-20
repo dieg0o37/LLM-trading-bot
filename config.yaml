@@ -1,0 +1,64 @@
+# ---------------------------------------------------------------------------
+# LLMTradingProg configuration
+# Everything the pipeline needs that is not a secret lives here.
+# Secrets (API keys) go in .env -- see .env.example
+# ---------------------------------------------------------------------------
+
+# The watch list. 15 mega-cap US names spread across sectors so the model has
+# real trade-offs to make rather than 7 correlated tech tickers.
+universe:
+  - AAPL   # Technology - Consumer Electronics
+  - MSFT   # Technology - Software
+  - NVDA   # Technology - Semiconductors
+  - GOOGL  # Communication Services
+  - AMZN   # Consumer Discretionary
+  - META   # Communication Services
+  - JPM    # Financials
+  - XOM    # Energy
+  - JNJ    # Healthcare
+  - PG     # Consumer Staples
+  - WMT    # Consumer Staples - Retail
+  - UNH    # Healthcare - Insurance
+  - HD     # Consumer Discretionary - Retail
+  - KO     # Consumer Staples - Beverages
+  - CAT    # Industrials
+
+# Benchmark used for beta / relative-strength calculations. Downloaded
+# alongside the universe but never proposed as a position.
+benchmark: SPY
+
+data:
+  # Yahoo Finance history depth. "10y" is the stated minimum; 15y gives the
+  # model a window that contains the 2020 crash AND the 2022 bear market.
+  period: "15y"
+  interval: "1d"
+  # Re-download if the cached parquet is older than this many hours.
+  cache_max_age_hours: 12
+
+news:
+  enabled: true            # falls back to disabled if no ALPHAVANTAGE_API_KEY
+  articles_per_ticker: 5   # how many headlines to put in the prompt
+  lookback_days: 7
+  # Alpha Vantage free tier is 25 requests/day. Cached responses are reused
+  # for this many hours so repeated runs do not burn the quota.
+  cache_max_age_hours: 24
+
+portfolio:
+  starting_cash: 100000.0
+  # Hard constraints. These are stated in the system prompt AND re-checked
+  # deterministically in Python after the model responds.
+  max_position_pct: 25.0
+  min_cash_pct: 10.0
+
+llm:
+  model: "claude-haiku-4-5"
+  max_tokens: 8000
+  temperature: 0.2
+  # "tool" -> forced strict tool use (default, showcases tool_use blocks)
+  # "json_schema" -> output_config.format structured output
+  output_mode: "tool"
+  # Extended thinking. Haiku 4.5 uses the budget_tokens form.
+  thinking_enabled: false
+  thinking_budget_tokens: 2000
+  # Ask the API to cache the system prompt + tool definition prefix.
+  prompt_caching: true

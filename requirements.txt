@@ -1,0 +1,15 @@
+# Core data stack
+pandas>=2.2
+numpy>=1.26
+yfinance>=0.2.40
+
+# Anthropic API
+anthropic>=0.40.0
+
+# Config / env / IO
+python-dotenv>=1.0
+PyYAML>=6.0
+requests>=2.31
+
+# Console output
+rich>=13.0
