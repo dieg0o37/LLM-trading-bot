@@ -1,4 +1,16 @@
 {
   "cash": 100000.0,
-  "positions": {}
+  "positions": {},
+  "inception_date": "2026-08-20",
+  "trades": [],
+  "history": [
+    {
+      "date": "2026-08-20",
+      "total_value": 100000.0,
+      "cash": 100000.0,
+      "positions_value": 0.0,
+      "realised_pnl_in_run": 0.0,
+      "note": "inception"
+    }
+  ]
 }
